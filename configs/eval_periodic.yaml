@@ -1,0 +1,34 @@
+# Table III: periodic transmission. Loaded on top of configs/base.yaml.
+# The env settings come from the controller checkpoint; env_overrides changes them for evaluation only.
+tracks:
+  start: 0                    # track seeds [start, start + n), identical for every cell (paired)
+  n: 200
+
+grid:
+  p_s: [0.2, 0.4, 0.6, 0.8, 1.0]
+  m: [1, 2, 3, 4, 6]
+
+channel_seed: 0               # delivery draws: rng([channel_seed, track_seed]), shared across cells
+
+policy:
+  deterministic: true         # OPEN: act with tanh(mean) rather than sampling
+  seed: 0                     # only used when deterministic is false
+
+env_overrides: {}
+
+runtime:
+  num_workers: 32             # env worker processes
+  num_slots: 256              # episodes run concurrently (across cells)
+  device: auto
+
+smoke:
+  tracks:
+    n: 3
+  grid:
+    p_s: [0.4, 1.0]
+    m: [1, 3]
+  env_overrides:
+    max_steps: 30
+  runtime:
+    num_workers: 2
+    num_slots: 6

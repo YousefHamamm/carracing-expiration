@@ -1,0 +1,58 @@
+# Controller training (PPO). Loaded on top of configs/base.yaml.
+# Values not fixed by CLAUDE.md are marked UNSPEC: standard PPO defaults, change as needed.
+seed: 0
+
+seeds:
+  track_start: 1000000        # controller training tracks: env i, episode j -> track_start + i + num_envs * j
+
+model:
+  cnn_channels: [16, 32, 32]  # IMPALA stages
+  embed_dim: 256              # linear after flatten, then LayerNorm
+  gru_hidden: 256             # UNSPEC
+  value_hidden: 256           # UNSPEC: width of the 2-layer value head
+  delta_scale: 20.0           # UNSPEC: Delta_n is fed as Delta_n / delta_scale
+  init_log_std: -0.5          # UNSPEC
+
+ppo:
+  num_envs: 512
+  rollout_len: 128
+  total_steps: 15000000       # control steps summed over all envs
+  gamma: 0.99                 # UNSPEC
+  gae_lambda: 0.95            # UNSPEC
+  clip: 0.2                   # UNSPEC
+  epochs: 4                   # UNSPEC: max epochs per update (KL early stop may cut this)
+  minibatches: 8              # UNSPEC: split over envs; each minibatch keeps full 128-step sequences
+  vf_coef: 0.5                # UNSPEC
+  ent_coef: 0.0               # UNSPEC
+  max_grad_norm: 0.5          # UNSPEC
+  reward_scale: 0.1           # UNSPEC: rewards are multiplied by this before GAE
+  lr_init: 3.0e-4             # UNSPEC: starting point inside [lr_min, lr_max]
+  lr_min: 2.0e-5
+  lr_max: 1.2e-3
+  kl_target: 0.02
+  lr_factor: 1.5              # UNSPEC: lr /= factor if KL > 2*target, lr *= factor if KL < target/2
+  early_stop_kl_mult: 1.5     # stop the update when sampled KL > 1.5 * target
+
+curriculum:
+  p_start: 1.0
+  p_end: 0.3
+  ramp_fraction: 0.4          # linear ramp over the first 40% of total_steps, then constant p_end
+
+runtime:
+  num_workers: 32             # env worker processes; envs are split evenly across them
+  device: auto                # auto | cpu | cuda
+  checkpoint_every: 10        # updates
+
+# Merged over everything above when --smoke is passed.
+smoke:
+  ppo:
+    num_envs: 4
+    rollout_len: 16
+    total_steps: 256
+    epochs: 2
+    minibatches: 2
+  runtime:
+    num_workers: 2
+    checkpoint_every: 2
+  env:
+    max_steps: 40

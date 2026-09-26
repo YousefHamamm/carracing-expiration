@@ -1,0 +1,15 @@
+# Shared settings. Values marked OPEN are placeholders pending a decision (see CLAUDE.md TODOs).
+env:
+  action_repeat: 6          # physics frames per control step
+  max_steps: 500            # OPEN: control-step time limit (default gym limit of 1000 frames = ~166 steps is too short for a lap)
+  offtrack_patience: 1      # OPEN: terminate after this many consecutive control steps with all wheels off the road
+  n_curvature: 20           # track segments ahead in s_n
+
+receiver:
+  k_buf: 4                  # OPEN: paper text says 4, figure says 6
+
+# Track seed ranges; every stage checks that its tracks stay inside its own range.
+seeds:
+  eval: [0, 100000]                 # evaluation tracks (Table III, main figure)
+  # [100000, 1000000) is reserved for predictor / SAQ training tracks
+  # controller training uses [1000000, inf): see configs/controller.yaml seeds.track_start
