@@ -147,3 +147,16 @@ class Controller(nn.Module):
 
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
+
+
+def load_controller(path, device="cpu") -> tuple[Controller, dict]:
+    """Loads a training checkpoint into a frozen (eval-mode, no-grad) controller.
+    Returns (model, the training config stored in the checkpoint)."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    cfg = ckpt["config"]
+    model = Controller.from_config(cfg["receiver"]["k_buf"], cfg["model"]).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model, cfg
