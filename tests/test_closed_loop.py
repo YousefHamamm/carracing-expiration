@@ -20,13 +20,15 @@ class RecordingModel:
     hidden_size = 1
 
     def __init__(self):
-        self.seen = []  # (frames, delta, prev_action, start) of slot 0 per call
+        self.seen = []  # (frames, Delta, prev_action, start) of slot 0 per call
+        self.ages = []  # all K_BUF frame ages of slot 0 per call
 
     def initial_state(self, batch, device=None):
         return torch.zeros(batch, 1)
 
     def act(self, frames, delta, prev_action, h, start, deterministic=True, generator=None):
-        self.seen.append((frames[0].numpy().copy(), int(delta[0]), prev_action[0].numpy().copy(), bool(start[0])))
+        self.ages.append(delta[0].numpy().copy())
+        self.seen.append((frames[0].numpy().copy(), int(delta[0, -1]), prev_action[0].numpy().copy(), bool(start[0])))
         B = len(delta)
         a = torch.as_tensor(np.tile(ACTION, (B, 1)))
         return a, a, torch.zeros(B), torch.zeros(B), h
@@ -40,8 +42,8 @@ def env_frames(seed, n):
     return frames
 
 
-def run_single(p_s, m, seed=5, channel_seed=0):
-    model = RecordingModel()
+def run_single(p_s, m, seed=5, channel_seed=0, model=None):
+    model = model or RecordingModel()
     with EnvPool(1, 1, ENV) as pool:
         res = run_jobs(model, pool, [Job("c", seed, p_s, PeriodicScheduler(m))], channel_seed)
     return model.seen, res["c"][0]
@@ -106,3 +108,11 @@ def test_many_cells_share_slots_and_report_each_cell():
 def test_stop_check_interrupts():
     with EnvPool(1, 1, ENV) as pool, pytest.raises(Interrupted):
         run_jobs(RecordingModel(), pool, [Job("c", 0, 1.0, PeriodicScheduler(1))], 0, stop_check=lambda: True)
+
+
+def test_controller_sees_all_frame_ages():
+    model = RecordingModel()
+    run_single(p_s=1.0, m=3, model=model)
+    # deliveries at n = 3, 6, 9: after n=6 the buffer holds frames 0, 0, 3, 6
+    assert list(model.ages[7]) == [7, 7, 4, 1]
+    assert list(model.ages[9]) == [9, 6, 3, 0]

@@ -65,3 +65,21 @@ def test_other_buffer_sizes(k):
 def test_invalid_k():
     with pytest.raises(ValueError):
         ReceiverBuffer(0)
+
+
+def test_ages_track_every_frame():
+    buf = ReceiverBuffer(4)
+    buf.reset(frame(0))
+    assert list(buf.ages) == [0, 0, 0, 0]
+    buf.update(None)
+    buf.update(frame(1))          # delivered after a gap of 2
+    assert list(buf.ages) == [2, 2, 2, 0]
+    buf.update(None)
+    buf.update(None)
+    buf.update(frame(2))          # gap of 3
+    assert list(buf.ages) == [5, 5, 3, 0]
+    buf.update(frame(3))
+    assert list(buf.ages) == [6, 4, 1, 0]
+    assert newest_values(buf) == [0, 1, 2, 3]
+    buf.update(None)
+    assert list(buf.ages) == [7, 5, 2, 1] and buf.delta == 1

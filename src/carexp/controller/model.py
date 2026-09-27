@@ -1,7 +1,10 @@
 """Recurrent actor-critic controller over the receiver's K_BUF delivered frames.
 
-IMPALA residual CNN (3 stages) -> flatten -> linear -> LayerNorm -> concat [Delta_n, previous action]
--> GRU -> tanh-squashed Gaussian policy head and 2-layer value head.
+IMPALA residual CNN (3 stages) -> flatten -> linear -> LayerNorm -> concat [ages of all K_BUF frames,
+previous action] -> GRU -> tanh-squashed Gaussian policy head and 2-layer value head.
+
+The ages (in steps, oldest slot first; the last one is Delta_n) tell the network how far apart the
+stacked frames are, which varies with the delivery pattern.
 """
 
 from __future__ import annotations
@@ -75,14 +78,14 @@ def gaussian_entropy(log_std):
 
 class Controller(nn.Module):
     def __init__(self, k_buf: int, cnn_channels=(16, 32, 32), embed_dim: int = 256,
-                 gru_hidden: int = 256, value_hidden: int = 256, delta_scale: float = 20.0,
+                 gru_hidden: int = 256, value_hidden: int = 256, age_scale: float = 20.0,
                  init_log_std: float = -0.5):
         super().__init__()
         self.k_buf = k_buf
-        self.delta_scale = delta_scale
+        self.age_scale = age_scale
         self.hidden_size = gru_hidden
         self.encoder = ImpalaEncoder(k_buf, cnn_channels, embed_dim)
-        self.gru = nn.GRUCell(embed_dim + 1 + ACTION_DIM, gru_hidden)
+        self.gru = nn.GRUCell(embed_dim + k_buf + ACTION_DIM, gru_hidden)
         self.pi_mean = nn.Linear(gru_hidden, ACTION_DIM)
         self.log_std = nn.Parameter(torch.full((ACTION_DIM,), float(init_log_std)))
         self.value = nn.Sequential(nn.Linear(gru_hidden, value_hidden), nn.ReLU(),
@@ -93,37 +96,37 @@ class Controller(nn.Module):
     @classmethod
     def from_config(cls, k_buf: int, cfg: dict) -> "Controller":
         return cls(k_buf, tuple(cfg["cnn_channels"]), cfg["embed_dim"], cfg["gru_hidden"],
-                   cfg["value_hidden"], cfg["delta_scale"], cfg["init_log_std"])
+                   cfg["value_hidden"], cfg["age_scale"], cfg["init_log_std"])
 
     def initial_state(self, batch: int, device=None) -> torch.Tensor:
         return torch.zeros(batch, self.hidden_size, device=device)
 
-    def _features(self, frames, delta, prev_action):
+    def _features(self, frames, ages, prev_action):
         z = self.encoder(frames)
-        d = (delta.float() / self.delta_scale).unsqueeze(-1)
-        return torch.cat([z, d, prev_action.float()], dim=-1)
+        return torch.cat([z, ages.float() / self.age_scale, prev_action.float()], dim=-1)
 
     def _heads(self, h):
         mean = self.pi_mean(h)
         log_std = self.log_std.clamp(LOG_STD_MIN, LOG_STD_MAX).expand_as(mean)
         return mean, log_std, self.value(h).squeeze(-1)
 
-    def step(self, frames, delta, prev_action, h, episode_start):
-        """One step for a batch. episode_start (B,) zeroes the hidden state before use.
+    def step(self, frames, ages, prev_action, h, episode_start):
+        """One step for a batch: frames (B, K, 96, 96) uint8, ages (B, K), prev_action (B, 2).
+        episode_start (B,) zeroes the hidden state before use.
 
         Returns (mean, log_std, value, new_h).
         """
         h = h * (1.0 - episode_start.float()).unsqueeze(-1)
-        h = self.gru(self._features(frames, delta, prev_action), h)
+        h = self.gru(self._features(frames, ages, prev_action), h)
         return (*self._heads(h), h)
 
-    def unroll(self, frames, delta, prev_action, h0, episode_start):
+    def unroll(self, frames, ages, prev_action, h0, episode_start):
         """Sequence version; inputs are (T, B, ...). The CNN runs over all T*B frames at once.
 
         Returns mean, log_std, value of shape (T, B, ...).
         """
-        T, B = delta.shape
-        x = self._features(frames.flatten(0, 1), delta.flatten(0, 1),
+        T, B = ages.shape[:2]
+        x = self._features(frames.flatten(0, 1), ages.flatten(0, 1),
                            prev_action.flatten(0, 1)).view(T, B, -1)
         keep = (1.0 - episode_start.float()).unsqueeze(-1)
         h, hs = h0, []
@@ -133,10 +136,10 @@ class Controller(nn.Module):
         return self._heads(torch.stack(hs))
 
     @torch.no_grad()
-    def act(self, frames, delta, prev_action, h, episode_start, deterministic: bool = False,
+    def act(self, frames, ages, prev_action, h, episode_start, deterministic: bool = False,
             generator: torch.Generator | None = None):
         """Returns (action in [-1,1]^2, pre-tanh u, log_prob, value, new_h)."""
-        mean, log_std, value, h = self.step(frames, delta, prev_action, h, episode_start)
+        mean, log_std, value, h = self.step(frames, ages, prev_action, h, episode_start)
         if deterministic:
             u = mean
         else:
@@ -152,7 +155,7 @@ def count_parameters(model: nn.Module) -> int:
 def load_controller(path, device="cpu") -> tuple[Controller, dict]:
     """Loads a training checkpoint into a frozen (eval-mode, no-grad) controller.
     Returns (model, the training config stored in the checkpoint)."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     model = Controller.from_config(cfg["receiver"]["k_buf"], cfg["model"]).to(device)
     model.load_state_dict(ckpt["model"])

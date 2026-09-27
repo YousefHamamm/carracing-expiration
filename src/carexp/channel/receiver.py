@@ -6,12 +6,12 @@ import numpy as np
 
 
 class ReceiverBuffer:
-    """Frames are ordered oldest -> newest along axis 0.
+    """Frames are ordered oldest -> newest along axis 0; ages[i] is the age in steps of frames[i].
 
-    reset(frame) fills every slot with the initial frame and sets Delta = 0 (the first frame
-    is delivered for free). update(frame) is called once per control step, before the
-    controller acts: a delivered frame is pushed and Delta resets to 0; with None the buffer
-    is frozen and Delta increments.
+    reset(frame) fills every slot with the initial frame, all at age 0 (the first frame is
+    delivered for free). update(frame) is called once per control step, before the controller
+    acts: every age increments, then a delivered frame is pushed at age 0; with None the frames
+    are frozen. Delta_n = ages[-1], the age of the newest frame.
     """
 
     def __init__(self, k_buf: int, frame_shape=(96, 96), dtype=np.uint8):
@@ -19,19 +19,24 @@ class ReceiverBuffer:
             raise ValueError(f"k_buf must be >= 1, got {k_buf}")
         self.k_buf = k_buf
         self.frames = np.zeros((k_buf, *frame_shape), dtype=dtype)
-        self.delta = 0
+        self.ages = np.zeros(k_buf, dtype=np.int64)
+
+    @property
+    def delta(self) -> int:
+        return int(self.ages[-1])
 
     def reset(self, frame: np.ndarray) -> None:
         self.frames[:] = frame
-        self.delta = 0
+        self.ages[:] = 0
 
     def update(self, frame: np.ndarray | None) -> None:
+        self.ages += 1
         if frame is None:
-            self.delta += 1
             return
         self.frames[:-1] = self.frames[1:]
         self.frames[-1] = frame
-        self.delta = 0
+        self.ages[:-1] = self.ages[1:]
+        self.ages[-1] = 0
 
     def observation(self) -> tuple[np.ndarray, int]:
         """(copy of the stacked frames, Delta_n)."""

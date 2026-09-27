@@ -1,7 +1,8 @@
-"""Parallel CarRacing envs with Bernoulli frame delivery and a receiver buffer per env.
+"""Parallel CarRacing envs with a per-episode delivery pattern and a receiver buffer per env.
 
-Physics runs in worker processes (each owns a slice of the envs). The channel draws and receiver
-buffers live in the main process, so workers only ship the newest frame per env.
+Physics runs in worker processes (each owns a slice of the envs). Delivery patterns, channel draws
+and receiver buffers live in the main process, so workers only ship the newest frame per env.
+Each episode draws its own pattern (p_s, Bernoulli or periodic m) from the DeliveryCurriculum.
 
 Track seeds: env i's j-th episode uses track_start + i + num_envs * j, so seeds are deterministic,
 never repeat, and resume from the saved per-env episode counters.
@@ -15,6 +16,7 @@ import signal
 import numpy as np
 
 from carexp.channel import ReceiverBuffer
+from carexp.controller.curriculum import DeliveryCurriculum, transmits
 from carexp.env import FRAME_SHAPE, CarRacingEnv, EnvConfig
 
 
@@ -48,16 +50,23 @@ def _worker(conn, env_cfg: EnvConfig, n_envs: int):
 
 
 class RemoteDrivingVecEnv:
-    """Batched view for the controller: receiver frames (N, K, 96, 96), Delta_n (N,),
+    """Batched view for the controller: receiver frames (N, K, 96, 96), frame ages (N, K),
     previous action (N, 2), episode-start flags (N,)."""
 
     def __init__(self, num_envs: int, num_workers: int, env_cfg: EnvConfig, k_buf: int,
-                 track_start: int, delivery_seed: int, episode_counters=None):
+                 track_start: int, delivery_seed: int, curriculum: DeliveryCurriculum,
+                 episode_counters=None):
         self.num_envs = num_envs
         self.track_start = track_start
         self.episode_counters = (np.zeros(num_envs, dtype=np.int64) if episode_counters is None
                                  else np.asarray(episode_counters, dtype=np.int64).copy())
         self.rng = np.random.default_rng(delivery_seed)
+        self.curriculum = curriculum
+        self.p_s = np.ones(num_envs)                     # current episode's delivery probability
+        self.period = np.zeros(num_envs, dtype=np.int64)  # 0 = Bernoulli, else periodic m
+        self.n = np.zeros(num_envs, dtype=np.int64)       # control steps into the current episode
+        self.sent = 0                                      # channel uses since the counters were read
+        self.delivered = 0
         self.receivers = [ReceiverBuffer(k_buf, FRAME_SHAPE) for _ in range(num_envs)]
         self.prev_action = np.zeros((num_envs, 2), dtype=np.float32)
         self.episode_start = np.ones(num_envs, dtype=bool)
@@ -80,7 +89,14 @@ class RemoteDrivingVecEnv:
         self.episode_counters[idx] += 1
         return seeds
 
-    def reset(self):
+    def _new_episodes(self, idx, step: int) -> None:
+        idx = np.asarray(idx)
+        self.p_s[idx], self.period[idx] = self.curriculum.sample(self.rng, step, len(idx))
+        self.n[idx] = 0
+
+    def reset(self, step: int = 0):
+        """Starts a fresh episode in every env; patterns are drawn for global step `step`."""
+        self._new_episodes(np.arange(self.num_envs), step)
         for conn, sl in zip(self.conns, self.slices):
             conn.send(("reset", self._next_seeds(sl).tolist()))
         for conn, sl in zip(self.conns, self.slices):
@@ -92,14 +108,15 @@ class RemoteDrivingVecEnv:
 
     def observation(self):
         frames = np.stack([r.frames for r in self.receivers])
-        delta = np.array([r.delta for r in self.receivers], dtype=np.int64)
-        return frames, delta, self.prev_action.copy(), self.episode_start.copy()
+        ages = np.stack([r.ages for r in self.receivers])
+        return frames, ages, self.prev_action.copy(), self.episode_start.copy()
 
-    def step(self, actions: np.ndarray, p_s: float):
-        """Apply actions, then deliver each new frame with probability p_s.
+    def step(self, actions: np.ndarray, step: int):
+        """Apply actions, then send/deliver each new frame according to its episode's pattern.
 
+        `step` is the global step, used to draw patterns for episodes that start now.
         Returns (obs, rewards, terminated, truncated, finals). finals is a list of
-        (env index, final receiver frames, final Delta, episode info) for envs whose episode
+        (env index, final receiver frames, final ages, episode info) for envs whose episode
         ended; the returned obs for those envs is already the first obs of the next episode.
         Seeds for the next episode are drawn before stepping, so an env that does not finish
         this step keeps its seed (the counter is rolled back).
@@ -112,8 +129,12 @@ class RemoteDrivingVecEnv:
         rewards = np.zeros(self.num_envs, dtype=np.float64)
         term = np.zeros(self.num_envs, dtype=bool)
         trunc = np.zeros(self.num_envs, dtype=bool)
-        deliver = self.rng.random(self.num_envs) < p_s
-        finals = []
+        self.n += 1
+        send = transmits(self.period, self.n)
+        deliver = send & (self.rng.random(self.num_envs) < self.p_s)
+        self.sent += int(send.sum())
+        self.delivered += int(deliver.sum())
+        finals, ended = [], []
         for conn, sl in zip(self.conns, self.slices):
             for i, (frame, r, te, tr, final) in zip(sl, conn.recv()):
                 rewards[i], term[i], trunc[i] = r, te, tr
@@ -126,12 +147,22 @@ class RemoteDrivingVecEnv:
                 else:
                     last_frame, frac, lap = final
                     rec.update(last_frame if deliver[i] else None)
-                    finals.append((i, rec.frames.copy(), rec.delta,
-                                   {"track_fraction": frac, "lap_finished": lap}))
+                    finals.append((i, rec.frames.copy(), rec.ages.copy(),
+                                   {"track_fraction": frac, "lap_finished": lap,
+                                    "p_s": float(self.p_s[i]), "period": int(self.period[i])}))
                     rec.reset(frame)
                     self.prev_action[i] = 0.0
                     self.episode_start[i] = True
+                    ended.append(i)
+        if ended:
+            self._new_episodes(ended, step)
         return self.observation(), rewards, term, trunc, finals
+
+    def pop_channel_counts(self) -> tuple[int, int]:
+        """(frames sent, frames delivered) since the last call."""
+        out = (self.sent, self.delivered)
+        self.sent = self.delivered = 0
+        return out
 
     def close(self):
         for conn in self.conns:

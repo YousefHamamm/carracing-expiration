@@ -13,15 +13,16 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from carexp.controller.curriculum import delivery_prob
+from carexp.controller.curriculum import DeliveryCurriculum
 from carexp.controller.model import Controller, count_parameters
 from carexp.controller.ppo import RolloutBuffer, compute_gae, ppo_update
 from carexp.controller.vec_env import RemoteDrivingVecEnv
 from carexp.env import FRAME_SHAPE, EnvConfig
 from carexp.utils.checkpoint import load_latest, save_checkpoint
 
-METRIC_FIELDS = ["update", "global_step", "p_s", "lr", "episodes", "ep_return", "ep_return_se",
-                 "ep_len", "track_fraction", "lap_rate", "delivery_rate", "policy_loss",
+METRIC_FIELDS = ["update", "global_step", "p_min", "p_s_mean", "periodic_frac", "lr", "episodes",
+                 "ep_return", "ep_return_se", "ep_len", "track_fraction", "lap_rate", "send_rate",
+                 "delivery_rate", "policy_loss",
                  "value_loss", "entropy", "kl", "clip_frac", "epochs_done", "early_stopped",
                  "sps", "wall_time"]
 
@@ -87,7 +88,7 @@ def train(cfg: dict, out_dir: str | Path) -> dict:
     delivery_seed = cfg["seed"] + 3
 
     lr, global_step, update, episode_counters = ppo_cfg["lr_init"], 0, 0, None
-    ckpt = load_latest(out_dir, map_location=device)
+    ckpt = load_latest(out_dir, map_location="cpu")
     if ckpt is not None:
         if ckpt["num_envs"] != N:
             raise ValueError(f"checkpoint has num_envs={ckpt['num_envs']}, config has {N}")
@@ -95,7 +96,7 @@ def train(cfg: dict, out_dir: str | Path) -> dict:
         optimizer.load_state_dict(ckpt["optimizer"])
         lr, global_step, update = ckpt["lr"], ckpt["global_step"], ckpt["update"]
         episode_counters = ckpt["episode_counters"]
-        torch.set_rng_state(ckpt["torch_rng"])
+        torch.set_rng_state(ckpt["torch_rng"].cpu())
         sample_gen.set_state(ckpt["sample_gen"].to(sample_gen.get_state().device))
         mb_gen.set_state(ckpt["mb_gen"])
         changed = _diff_keys(ckpt["config"], cfg)
@@ -123,38 +124,37 @@ def train(cfg: dict, out_dir: str | Path) -> dict:
         tqdm.write("[controller] already finished")
         return {"reason": "done", "update": update, "global_step": global_step}
 
+    curriculum = DeliveryCurriculum.from_config(cfg["curriculum"], total)
     vec = RemoteDrivingVecEnv(N, rt["num_workers"], EnvConfig.from_dict(cfg["env"]), k_buf,
-                              cfg["seeds"]["track_start"], delivery_seed, episode_counters)
+                              cfg["seeds"]["track_start"], delivery_seed, curriculum, episode_counters)
     if ckpt is not None:
         vec.rng.bit_generator.state = ckpt["delivery_rng"]
 
     buf = RolloutBuffer(T, N, k_buf, FRAME_SHAPE, model.hidden_size)
     to = lambda x: torch.as_tensor(x, device=device)  # noqa: E731
     gamma, rscale = ppo_cfg["gamma"], ppo_cfg["reward_scale"]
-    cur = cfg["curriculum"]
 
     reason = "done"
     t_start = time.time()
     pbar = tqdm(total=total, initial=global_step, unit="step", dynamic_ncols=True, desc="controller")
     try:
-        obs = vec.reset()
+        obs = vec.reset(global_step)
         h = model.initial_state(N, device)
         ep_return = np.zeros(N)
         ep_len = np.zeros(N, dtype=np.int64)
         while global_step < total:
             t0 = time.time()
-            p_s = delivery_prob(global_step, total, cur["p_start"], cur["p_end"], cur["ramp_fraction"])
+            p_min = curriculum.p_min(global_step)
             buf.h0 = h.detach().cpu().clone()
-            completed, deliveries, frames_seen = [], 0, 0
+            completed = []
+            vec.pop_channel_counts()
             for t in range(T):
-                frames, delta, prev_a, start = obs
-                buf.frames[t], buf.delta[t], buf.prev_action[t], buf.episode_start[t] = frames, delta, prev_a, start
-                a, u, logp, v, h = model.act(to(frames), to(delta), to(prev_a), h, to(start),
+                frames, ages, prev_a, start = obs
+                buf.frames[t], buf.ages[t], buf.prev_action[t], buf.episode_start[t] = frames, ages, prev_a, start
+                a, u, logp, v, h = model.act(to(frames), to(ages), to(prev_a), h, to(start),
                                              generator=sample_gen)
                 a_np = a.cpu().numpy()
-                obs, r, term, trunc, finals = vec.step(a_np, p_s)
-                deliveries += int((obs[1] == 0).sum() - obs[3].sum())
-                frames_seen += N - int(obs[3].sum())
+                obs, r, term, trunc, finals = vec.step(a_np, global_step + (t + 1) * N)
 
                 ep_return += r
                 ep_len += 1
@@ -164,7 +164,7 @@ def train(cfg: dict, out_dir: str | Path) -> dict:
                     idx = [f[0] for f in boot]
                     with torch.no_grad():
                         _, _, v_final, _ = model.step(
-                            to(np.stack([f[1] for f in boot])), to(np.array([f[2] for f in boot])),
+                            to(np.stack([f[1] for f in boot])), to(np.stack([f[2] for f in boot])),
                             to(a_np[idx]), h[idx], torch.zeros(len(idx), device=device))
                     r_scaled[idx] += gamma * v_final.cpu().numpy()
                 for i, _, _, info in finals:
@@ -175,11 +175,12 @@ def train(cfg: dict, out_dir: str | Path) -> dict:
                 buf.reward[t], buf.done[t] = r_scaled, term | trunc
 
             with torch.no_grad():
-                frames, delta, prev_a, start = obs
-                _, _, last_v, _ = model.step(to(frames), to(delta), to(prev_a), h, to(start))
+                frames, ages, prev_a, start = obs
+                _, _, last_v, _ = model.step(to(frames), to(ages), to(prev_a), h, to(start))
             buf.advantage, buf.returns = compute_gae(buf.reward, buf.value, buf.done,
                                                      last_v.cpu().numpy(), gamma, ppo_cfg["gae_lambda"])
 
+            sent, delivered = vec.pop_channel_counts()
             stats, lr = ppo_update(model, optimizer, buf, ppo_cfg, lr, device, mb_gen)
             global_step += T * N
             update += 1
@@ -188,14 +189,16 @@ def train(cfg: dict, out_dir: str | Path) -> dict:
             ep = np.array(completed, dtype=np.float64).reshape(-1, 4)
             n_ep = len(ep)
             row = {
-                "update": update, "global_step": global_step, "p_s": round(p_s, 4), "lr": stats.lr,
+                "update": update, "global_step": global_step, "p_min": round(p_min, 4),
+                "p_s_mean": float(vec.p_s.mean()), "periodic_frac": float((vec.period > 0).mean()),
+                "lr": stats.lr,
                 "episodes": n_ep,
                 "ep_return": ep[:, 0].mean() if n_ep else float("nan"),
                 "ep_return_se": ep[:, 0].std(ddof=1) / np.sqrt(n_ep) if n_ep > 1 else float("nan"),
                 "ep_len": ep[:, 1].mean() if n_ep else float("nan"),
                 "track_fraction": ep[:, 2].mean() if n_ep else float("nan"),
                 "lap_rate": ep[:, 3].mean() if n_ep else float("nan"),
-                "delivery_rate": deliveries / max(frames_seen, 1),
+                "send_rate": sent / (T * N), "delivery_rate": delivered / (T * N),
                 "policy_loss": stats.policy_loss, "value_loss": stats.value_loss,
                 "entropy": stats.entropy, "kl": stats.kl, "clip_frac": stats.clip_frac,
                 "epochs_done": stats.epochs_done, "early_stopped": int(stats.early_stopped),
@@ -203,9 +206,10 @@ def train(cfg: dict, out_dir: str | Path) -> dict:
             }
             with open(metrics_path, "a", newline="") as f:
                 csv.DictWriter(f, METRIC_FIELDS).writerow(row)
-            pbar.set_postfix(ret=f"{row['ep_return']:.1f}", p_s=f"{p_s:.2f}", kl=f"{stats.kl:.4f}", lr=f"{stats.lr:.1e}")
+            pbar.set_postfix(ret=f"{row['ep_return']:.1f}", p_min=f"{p_min:.2f}", kl=f"{stats.kl:.4f}", lr=f"{stats.lr:.1e}")
             tqdm.write(
-                f"[update {update:5d} | step {global_step:>11,}] p_s={p_s:.3f} lr={stats.lr:.2e}->{lr:.2e} "
+                f"[update {update:5d} | step {global_step:>11,}] p_s~U[{p_min:.2f},{curriculum.p_max:.1f}] "
+                f"sent={row['send_rate']:.2f} deliv={row['delivery_rate']:.2f} lr={stats.lr:.2e}->{lr:.2e} "
                 f"eps={n_ep} return={row['ep_return']:.1f}±{row['ep_return_se']:.1f} "
                 f"track={row['track_fraction']:.3f} kl={stats.kl:.4f} epochs={stats.epochs_done:.2f}"
                 f"{' (KL stop)' if stats.early_stopped else ''} vloss={stats.value_loss:.3f} "

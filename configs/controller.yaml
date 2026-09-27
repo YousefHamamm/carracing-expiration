@@ -10,7 +10,7 @@ model:
   embed_dim: 256              # linear after flatten, then LayerNorm
   gru_hidden: 256             # UNSPEC
   value_hidden: 256           # UNSPEC: width of the 2-layer value head
-  delta_scale: 20.0           # UNSPEC: Delta_n is fed as Delta_n / delta_scale
+  age_scale: 20.0             # UNSPEC: the K_BUF frame ages are fed as age / age_scale
   init_log_std: -0.5          # UNSPEC
 
 ppo:
@@ -21,7 +21,7 @@ ppo:
   gae_lambda: 0.95            # UNSPEC
   clip: 0.2                   # UNSPEC
   epochs: 4                   # UNSPEC: max epochs per update (KL early stop may cut this)
-  minibatches: 8              # UNSPEC: split over envs; each minibatch keeps full 128-step sequences
+  minibatches: 32             # UNSPEC: split over envs (16 envs each); each minibatch keeps full 128-step sequences
   vf_coef: 0.5                # UNSPEC
   ent_coef: 0.0               # UNSPEC
   max_grad_norm: 0.5          # UNSPEC
@@ -33,10 +33,17 @@ ppo:
   lr_factor: 1.5              # UNSPEC: lr /= factor if KL > 2*target, lr *= factor if KL < target/2
   early_stop_kl_mult: 1.5     # stop the update when sampled KL > 1.5 * target
 
+# Per env and per episode: p_s ~ Uniform[p_min(t), p_max]; p_min anneals linearly from p_min_start
+# to p_min_end over the first ramp_fraction of total_steps, then stays at p_min_end.
+# With probability periodic_prob the episode is periodic (send every m steps, m uniform over periods,
+# each sent frame lost with probability 1 - p_s); otherwise Bernoulli (send every step).
 curriculum:
-  p_start: 1.0
-  p_end: 0.3
-  ramp_fraction: 0.4          # linear ramp over the first 40% of total_steps, then constant p_end
+  p_min_start: 1.0
+  p_min_end: 0.3
+  p_max: 1.0
+  ramp_fraction: 0.4
+  periodic_prob: 0.5
+  periods: [1, 2, 3, 4, 5, 6]
 
 runtime:
   num_workers: 32             # env worker processes; envs are split evenly across them

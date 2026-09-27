@@ -115,10 +115,10 @@ def run_jobs(model: Controller, pool: EnvPool, jobs: list[Job], channel_seed: in
         if active:
             idx = torch.as_tensor(active, device=device)
             frames = torch.as_tensor(np.stack([slots[i].receiver.frames for i in active]), device=device)
-            delta = torch.as_tensor([slots[i].receiver.delta for i in active], device=device)
+            ages = torch.as_tensor(np.stack([slots[i].receiver.ages for i in active]), device=device)
             prev_a = torch.as_tensor(np.stack([slots[i].prev_action for i in active]), device=device)
             start = torch.as_tensor([slots[i].episode_start for i in active], device=device)
-            a, _, _, _, h_new = model.act(frames, delta, prev_a, h[idx], start,
+            a, _, _, _, h_new = model.act(frames, ages, prev_a, h[idx], start,
                                           deterministic=deterministic, generator=gen)
             h[idx] = h_new
             a = a.cpu().numpy()

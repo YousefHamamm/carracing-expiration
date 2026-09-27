@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from carexp.controller.curriculum import delivery_prob
+from carexp.controller.curriculum import p_min_at
 from carexp.controller.model import Controller
 from carexp.controller.ppo import RolloutBuffer, adapt_lr, compute_gae, ppo_update, sampled_kl
 
@@ -10,13 +10,13 @@ PPO = dict(epochs=1, minibatches=1, clip=0.2, vf_coef=0.5, ent_coef=0.0, max_gra
            kl_target=0.02, early_stop_kl_mult=1.5, lr_min=2e-5, lr_max=1.2e-3, lr_factor=1.5)
 
 
-def test_curriculum():
+def test_p_min_schedule():
     total = 1000
-    assert delivery_prob(0, total) == 1.0
-    assert delivery_prob(200, total) == pytest.approx(0.65)
-    assert delivery_prob(400, total) == pytest.approx(0.3)
-    assert delivery_prob(999, total) == pytest.approx(0.3)
-    ps = [delivery_prob(s, total) for s in range(0, 400, 10)]
+    assert p_min_at(0, total) == 1.0
+    assert p_min_at(200, total) == pytest.approx(0.65)
+    assert p_min_at(400, total) == pytest.approx(0.3)
+    assert p_min_at(999, total) == pytest.approx(0.3)
+    ps = [p_min_at(s, total) for s in range(0, 400, 10)]
     assert all(a > b for a, b in zip(ps, ps[1:]))
 
 
@@ -63,10 +63,10 @@ def make_buffer(model, T=8, N=4, seed=0):
     buf.h0 = h.clone()
     for t in range(T):
         buf.frames[t] = torch.randint(0, 256, (N, model.k_buf, 96, 96), generator=g, dtype=torch.uint8).numpy()
-        buf.delta[t] = torch.randint(0, 5, (N,), generator=g).numpy()
+        buf.ages[t] = torch.randint(0, 5, (N, model.k_buf), generator=g).numpy()
         buf.prev_action[t] = (torch.rand(N, 2, generator=g) * 2 - 1).numpy()
         buf.episode_start[t] = (torch.rand(N, generator=g) < 0.25).numpy()
-        a, u, logp, v, h = model.act(torch.as_tensor(buf.frames[t]), torch.as_tensor(buf.delta[t]),
+        a, u, logp, v, h = model.act(torch.as_tensor(buf.frames[t]), torch.as_tensor(buf.ages[t]),
                                      torch.as_tensor(buf.prev_action[t]), h,
                                      torch.as_tensor(buf.episode_start[t]), generator=g)
         buf.u[t], buf.log_prob[t], buf.value[t] = u.numpy(), logp.numpy(), v.numpy()

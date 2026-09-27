@@ -18,7 +18,7 @@ class RolloutBuffer:
     def __init__(self, T: int, N: int, k_buf: int, frame_shape, hidden: int):
         self.T, self.N = T, N
         self.frames = np.zeros((T, N, k_buf, *frame_shape), dtype=np.uint8)
-        self.delta = np.zeros((T, N), dtype=np.int64)
+        self.ages = np.zeros((T, N, k_buf), dtype=np.int64)
         self.prev_action = np.zeros((T, N, 2), dtype=np.float32)
         self.episode_start = np.zeros((T, N), dtype=bool)
         self.u = np.zeros((T, N, 2), dtype=np.float32)
@@ -98,7 +98,7 @@ def ppo_update(model: Controller, optimizer: torch.optim.Optimizer, buf: Rollout
         perm = torch.randperm(buf.N, generator=generator).numpy()
         for mb in np.array_split(perm, n_mb):
             mean, log_std, value = model.unroll(
-                to(buf.frames[:, mb]), to(buf.delta[:, mb]), to(buf.prev_action[:, mb]),
+                to(buf.frames[:, mb]), to(buf.ages[:, mb]), to(buf.prev_action[:, mb]),
                 buf.h0[mb].to(device), to(buf.episode_start[:, mb]))
             u = to(buf.u[:, mb])
             logp = squashed_log_prob(u, mean, log_std)

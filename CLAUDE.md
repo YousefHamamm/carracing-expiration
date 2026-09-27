@@ -18,12 +18,12 @@ Reproduce Section VI of our paper: a remote-driving loop where a vehicle (sender
 
 ## Controller (trained once, then frozen)
 - IMPALA-style residual CNN encoder, 3 stages with 16, 32, 32 channels, over the K_BUF stacked delivered frames.
-- Flatten -> linear to 256 -> LayerNorm -> concat [Delta_n, previous action] -> GRU.
+- Flatten -> linear to 256 -> LayerNorm -> concat [ages of all K_BUF buffered frames (the newest one is Delta_n), previous action] -> GRU.
 - Gaussian policy head with tanh squashing; 2-layer value head. About 1.6M parameters total.
 - PPO, 512 parallel envs, rollout segments of 128 steps, recurrent state carried across segments.
 - Adaptive LR from sampled KL in [2e-5, 1.2e-3], KL target 0.02, early stop when sampled KL > 1.5 x target.
-- Curriculum: delivery probability goes linearly from 1.0 to 0.3 over the first 40% of 15M steps, then stays at 0.3.  # TODO: confirm constant 0.3 after, or random p_s per env.
-- During training, deliveries are random Bernoulli (no scheduler).
+- Curriculum: in each env and each episode, p_s ~ Uniform[p_min(t), 1.0]; p_min goes linearly from 1.0 to 0.3 over the first 40% of 15M steps, then stays at 0.3.
+- Delivery pattern per episode (no scheduler): with prob 0.5 Bernoulli(p_s) every step; otherwise periodic with m ~ Uniform{1,...,6}, each sent frame lost with prob 1 - p_s.
 
 ## Expiration time (oracle)
 - For a frame y_n delivered at step n, freeze the receiver buffer and let the controller act on it for k steps. The expiration time is the largest k with r_0 - r_k <= eps, following eq. (tau-star) in the paper.

@@ -15,7 +15,7 @@ def model():
 def inputs(T, B, k=4, seed=0):
     g = torch.Generator().manual_seed(seed)
     frames = torch.randint(0, 256, (T, B, k, 96, 96), generator=g, dtype=torch.uint8)
-    delta = torch.randint(0, 10, (T, B), generator=g)
+    delta = torch.randint(0, 10, (T, B, k), generator=g)  # ages of the K buffered frames
     prev_a = torch.rand(T, B, 2, generator=g) * 2 - 1
     start = torch.rand(T, B, generator=g) < 0.2
     return frames, delta, prev_a, start
@@ -31,7 +31,7 @@ def test_architecture(model):
     assert model.encoder.stages[0].conv.in_channels == 4  # K_BUF stacked frames
     assert model.encoder.fc.out_features == 256
     assert isinstance(model.encoder.norm, torch.nn.LayerNorm)
-    assert model.gru.input_size == 256 + 1 + 2
+    assert model.gru.input_size == 256 + 4 + 2  # embedding, K_BUF frame ages, previous action
 
 
 def test_output_shapes(model):
@@ -90,3 +90,15 @@ def test_frame_scale_does_not_matter_for_dtype(model):
     with torch.no_grad():
         z = model.encoder(frames[0])
     assert np.isfinite(z.numpy()).all()
+
+
+def test_policy_depends_on_every_frame_age(model):
+    """Two buffers with the same newest age but different spacing must give different outputs."""
+    frames, _, prev_a, start = inputs(1, 1)
+    h = model.initial_state(1)
+    dense = torch.tensor([[3, 2, 1, 0]])
+    sparse = torch.tensor([[9, 6, 3, 0]])
+    with torch.no_grad():
+        m1, _, v1, _ = model.step(frames[0], dense, prev_a[0], h, start[0])
+        m2, _, v2, _ = model.step(frames[0], sparse, prev_a[0], h, start[0])
+    assert not torch.allclose(v1, v2)
